@@ -37,7 +37,7 @@ jobs:
           PLATFORM: euw1
           # Empty or HIGH_ELO samples the master+ ladders; name rank tiers
           # (e.g. GOLD,PLATINUM) to sample the band you actually queue into.
-          RANK_TIERS: ''
+          RANK_TIERS: 'EMERALD,DIAMOND'
           MATCH_BUDGET: '1500'
           MIN_GAMES: '30'
           # A week of games, matching the schedule. Longer wastes requests on
