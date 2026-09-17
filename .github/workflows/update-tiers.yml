@@ -35,8 +35,17 @@ jobs:
         env:
           RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
           PLATFORM: euw1
+          # Empty or HIGH_ELO samples the master+ ladders; name rank tiers
+          # (e.g. GOLD,PLATINUM) to sample the band you actually queue into.
+          RANK_TIERS: ''
           MATCH_BUDGET: '1500'
           MIN_GAMES: '30'
+          # A week of games, matching the schedule. Longer wastes requests on
+          # the previous patch; gameVersion discards those anyway.
+          MATCH_WINDOW_DAYS: '7'
+          # Paced for a Personal key. A development key needs 1250 here.
+          REQUEST_INTERVAL_MS: '150'
+          MAX_REQUESTS: '12000'
         run: node update-tiers.cjs
 
       # The script validates before writing, so anything here is publishable.

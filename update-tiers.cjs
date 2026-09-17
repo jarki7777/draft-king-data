@@ -58,6 +58,20 @@ const TIER_BANDS = [
 /** Phantom games pulling each champion toward its role's mean win rate. */
 const PRIOR_GAMES = 150;
 
+/**
+ * Weight on presence (pick rate + ban rate) when ranking a role. At 0.10 a
+ * champion present in 30% of games gains the equivalent of 3 points of win
+ * rate — enough to separate a contested pick from a niche one, not enough to
+ * let popularity outrank results.
+ */
+const PRESENCE_COEF = 0.10;
+
+/** Ranked ladder pages to walk when sampling a specific rank band. */
+const DIVISIONS = ['I', 'II', 'III', 'IV'];
+
+/** Players to gather before sampling their matches. */
+const PUUID_POOL = 1000;
+
 // ── Riot API plumbing ───────────────────────────────────────────────────────
 
 /**
@@ -141,10 +155,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * Folds one match into per-champion, per-role counters. Keyed `id|role` so a
  * champion played in two roles is judged in each separately.
  */
-function collectMatch(match, championById, stats) {
+function collectMatch(match, championById, stats, bans = {}) {
   const info = match?.info;
   if (!info || info.queueId !== RANKED_SOLO) return 0;
   if ((info.gameDuration ?? 0) < REMAKE_MAX_SECONDS) return 0;
+
+  // Bans are champion-level, not role-level: a ban says the champion was
+  // worth removing from the game, without saying which lane feared it.
+  for (const team of info.teams ?? []) {
+    for (const b of team.bans ?? []) {
+      const id = championById[b.championId];
+      if (id) bans[id] = (bans[id] ?? 0) + 1;
+    }
+  }
 
   let counted = 0;
   for (const p of info.participants ?? []) {
@@ -170,7 +193,10 @@ function collectMatch(match, championById, stats) {
  * signal, and the app keeps its bundled tier when we omit it. Win rates are
  * shrunk toward the role's own mean, so a small sample cannot reach S+.
  */
-function computeTiers(stats, { minGames = 30, priorGames = PRIOR_GAMES } = {}) {
+function computeTiers(stats, {
+  minGames = 30, priorGames = PRIOR_GAMES, matches = 0, bans = {},
+  presenceCoef = PRESENCE_COEF,
+} = {}) {
   const mainByChampion = {};
   for (const s of Object.values(stats)) {
     const current = mainByChampion[s.id];
@@ -184,19 +210,40 @@ function computeTiers(stats, { minGames = 30, priorGames = PRIOR_GAMES } = {}) {
     r.wins += s.wins;
   }
 
+  // Two players fill each role per match, so this is the number of chances a
+  // champion had to be picked in that role.
+  const roleSlots = matches * 2;
+
   const byRole = {};
   for (const s of Object.values(mainByChampion)) {
     if (s.games < minGames) continue;
     const mean = roleMean[s.role].games > 0 ? roleMean[s.role].wins / roleMean[s.role].games : 0.5;
     const shrunk = (s.wins + priorGames * mean) / (s.games + priorGames);
-    (byRole[s.role] ?? (byRole[s.role] = [])).push({ ...s, shrunk, rawWr: s.wins / s.games });
+
+    // Presence corrects win rate's biggest blind spot. A champion picked in
+    // 0.5% of games at 54% is usually a specialist pick: the win rate belongs
+    // to the few people who main it, not to the champion. One that is picked
+    // or banned constantly is being respected by everyone.
+    const pickRate = roleSlots > 0 ? s.games / roleSlots : 0;
+    const banRate = matches > 0 ? (bans[s.id] ?? 0) / matches : 0;
+    const presence = pickRate + banRate;
+
+    (byRole[s.role] ?? (byRole[s.role] = [])).push({
+      ...s,
+      shrunk,
+      rawWr: s.wins / s.games,
+      pickRate,
+      banRate,
+      presence,
+      composite: shrunk + presenceCoef * presence,
+    });
   }
 
   const tiers = {};
   const detail = [];
   for (const [role, list] of Object.entries(byRole)) {
     // Best first, then banded by position so tiers are relative to the role.
-    list.sort((a, b) => b.shrunk - a.shrunk);
+    list.sort((a, b) => b.composite - a.composite);
     list.forEach((entry, i) => {
       // Midpoint of the entry's slot, so a 1-champion role lands mid-table
       // instead of automatically taking S+.
@@ -206,6 +253,8 @@ function computeTiers(stats, { minGames = 30, priorGames = PRIOR_GAMES } = {}) {
       detail.push({
         id: entry.id, role, tier: band.tier, games: entry.games,
         winRate: Number(entry.rawWr.toFixed(4)), shrunk: Number(entry.shrunk.toFixed(4)),
+        pickRate: Number(entry.pickRate.toFixed(4)), banRate: Number(entry.banRate.toFixed(4)),
+        composite: Number(entry.composite.toFixed(4)),
       });
     });
   }
@@ -226,6 +275,65 @@ function validateFeed(feed) {
   }
 }
 
+/**
+ * Gathers the players whose games become the sample.
+ *
+ * `HIGH_ELO` walks the challenger/grandmaster/master ladders — the strongest
+ * play, but a meta that can differ sharply from everyone else's: champions that
+ * need setup and coordination overperform there, lane bullies underperform.
+ * Naming rank tiers instead (e.g. `GOLD,PLATINUM`) samples the band you
+ * actually queue into, which is the meta your draft is really against.
+ */
+async function collectPuuids(riot, platformHost, rankTiers) {
+  const puuids = [];
+
+  if (rankTiers.length === 0) {
+    for (const path of ['challengerleagues', 'grandmasterleagues', 'masterleagues']) {
+      const league = await riot.get(platformHost, `/lol/league/v4/${path}/by-queue/RANKED_SOLO_5x5`);
+      for (const e of league?.entries ?? []) if (e.puuid) puuids.push(e.puuid);
+      console.log(`  ${path}: ${league?.entries?.length ?? 0} entries`);
+    }
+    return puuids;
+  }
+
+  // Paged ladders, unlike match history, honour the page parameter — verified
+  // against a live client. Pages run out quietly, returning an empty array.
+  const seen = new Set();
+  for (const tier of rankTiers) {
+    for (const division of DIVISIONS) {
+      if (seen.size >= PUUID_POOL) break;
+      for (let page = 1; page <= 5 && seen.size < PUUID_POOL; page += 1) {
+        const entries = await riot.get(
+          platformHost,
+          `/lol/league/v4/entries/RANKED_SOLO_5x5/${tier}/${division}?page=${page}`,
+        );
+        if (!Array.isArray(entries) || entries.length === 0) break;
+        // Pages overlap slightly as players gain and lose LP mid-walk.
+        for (const e of entries) if (e.puuid && !seen.has(e.puuid)) seen.add(e.puuid);
+      }
+      console.log(`  ${tier} ${division}: pool at ${seen.size}`);
+    }
+  }
+  return [...seen];
+}
+
+const RANK_TIER_NAMES = new Set([
+  'IRON', 'BRONZE', 'SILVER', 'GOLD', 'PLATINUM', 'EMERALD', 'DIAMOND',
+]);
+
+/** '' or 'HIGH_ELO' means the master+ ladders; otherwise a list of rank tiers. */
+function parseRankTiers(raw) {
+  const value = (raw ?? '').trim().toUpperCase();
+  if (value === '' || value === 'HIGH_ELO') return [];
+  const tiers = value.split(/[,\s]+/).filter(Boolean);
+  for (const t of tiers) {
+    if (!RANK_TIER_NAMES.has(t)) {
+      throw new Error(`unknown rank tier ${t} — use HIGH_ELO or any of ${[...RANK_TIER_NAMES].join(', ')}`);
+    }
+  }
+  return tiers;
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -237,10 +345,27 @@ async function main() {
   const matchBudget = Number(process.env.MATCH_BUDGET || 1500);
   const minGames = Number(process.env.MIN_GAMES || 30);
   const out = process.env.OUT || 'tiers.json';
+  const rankTiers = parseRankTiers(process.env.RANK_TIERS);
+  const band = rankTiers.length === 0 ? 'high-elo' : rankTiers.join('+').toLowerCase();
+  // Only games from the last few days. Patches run about two weeks, so a short
+  // window is mostly current-patch games; gameVersion still has the last word.
+  const windowDays = Number(process.env.MATCH_WINDOW_DAYS || 7);
+  const windowStart = Math.floor((Date.now() - windowDays * 86_400_000) / 1000);
+  // A hard ceiling so a bad ratio of usable games can't run until the job is
+  // killed, which would publish nothing at all.
+  const maxRequests = Number(process.env.MAX_REQUESTS || 12_000);
+  console.log(
+    `sampling ${band} on ${platform}, budget ${matchBudget} matches, `
+    + `${windowDays}d window, ${maxRequests} request ceiling`,
+  );
 
   const platformHost = `${platform}.api.riotgames.com`;
   const regionHost = `${region}.api.riotgames.com`;
-  const riot = new RiotClient(apiKey);
+  // Development keys allow 100 requests per 2 minutes, so ~1.25s apart.
+  // A Personal key allows far more; the workflow lowers this.
+  const riot = new RiotClient(apiKey, {
+    minIntervalMs: Number(process.env.REQUEST_INTERVAL_MS || 1250),
+  });
 
   const versions = await getJson('https://ddragon.leagueoflegends.com/api/versions.json');
   const patch = versions[0];
@@ -251,16 +376,7 @@ async function main() {
   for (const c of Object.values(ddragon.data)) championById[Number(c.key)] = c.id;
   console.log(`patch ${patch}, ${Object.keys(championById).length} champions`);
 
-  // High-elo ladders: the strongest signal per game sampled, and small enough
-  // to enumerate. Master is the big one; challenger/GM add the very top.
-  const puuids = [];
-  for (const tierPath of ['challengerleagues', 'grandmasterleagues', 'masterleagues']) {
-    const league = await riot.get(
-      platformHost, `/lol/league/v4/${tierPath}/by-queue/RANKED_SOLO_5x5`,
-    );
-    for (const e of league?.entries ?? []) if (e.puuid) puuids.push(e.puuid);
-    console.log(`  ${tierPath}: ${league?.entries?.length ?? 0} entries`);
-  }
+  const puuids = await collectPuuids(riot, platformHost, rankTiers);
   if (puuids.length === 0) {
     throw new Error('no puuids from the league endpoints — has the response shape changed?');
   }
@@ -272,6 +388,7 @@ async function main() {
   // instead would quietly halve the sample exactly when the meta is moving
   // fastest and the data matters most.
   const stats = {};
+  const bans = {};
   const seen = new Set();
   const patchPrefix = patch.split('.').slice(0, 2).join('.');
   let matches = 0;
@@ -279,12 +396,17 @@ async function main() {
 
   for (const puuid of puuids) {
     if (matches >= matchBudget) break;
+    if (riot.requests >= maxRequests) break;
+    // Ask only for games inside the window. Without this the job spends most
+    // of its requests fetching matches it then throws away for being on the
+    // previous patch — 9 in 10 of them in a mid-ladder sample.
     const ids = await riot.get(
       regionHost,
-      `/lol/match/v5/matches/by-puuid/${puuid}/ids?queue=${RANKED_SOLO}&type=ranked&count=10`,
+      `/lol/match/v5/matches/by-puuid/${puuid}/ids`
+      + `?queue=${RANKED_SOLO}&type=ranked&count=20&startTime=${windowStart}`,
     );
     for (const id of ids ?? []) {
-      if (matches >= matchBudget) break;
+      if (matches >= matchBudget || riot.requests >= maxRequests) break;
       if (seen.has(id)) continue;
       seen.add(id);
       const match = await riot.get(regionHost, `/lol/match/v5/matches/${id}`);
@@ -294,7 +416,7 @@ async function main() {
         skippedPatch += 1;
         continue;
       }
-      if (collectMatch(match, championById, stats) > 0) {
+      if (collectMatch(match, championById, stats, bans) > 0) {
         matches += 1;
         if (matches % 100 === 0) {
           console.log(`  ${matches}/${matchBudget} matches, ${riot.requests} requests`);
@@ -306,16 +428,18 @@ async function main() {
     `aggregated ${matches} matches on patch ${patchPrefix} `
     + `(${skippedPatch} skipped as off-patch, ${riot.requests} requests)`,
   );
-  if (matches < matchBudget) {
+  if (riot.requests >= maxRequests) {
+    console.warn(`  hit the ${maxRequests} request ceiling — publishing what validated`);
+  } else if (matches < matchBudget) {
     console.warn(`  ran out of players before the budget — sampled ${matches}`);
   }
 
-  const { tiers, detail } = computeTiers(stats, { minGames });
+  const { tiers, detail } = computeTiers(stats, { minGames, matches, bans });
   const feed = {
     version: 1,
     patch,
     generatedAt: new Date().toISOString(),
-    source: `riot-api:${platform}:high-elo`,
+    source: `riot-api:${platform}:${band}`,
     sampleGames: matches,
     tiers,
   };
@@ -389,6 +513,33 @@ function selfTest() {
   assert.ok(!('Fringe' in tiers), 'below minGames is omitted, not guessed');
   assert.ok(!Object.values(tiers).includes(undefined), 'every tiered champion got a band');
 
+  // Presence: two champions with identical records, one contested, one niche.
+  const contested = {
+    'Niche|mid': { id: 'Niche', role: 'mid', games: 60, wins: 33 },
+    'Contested|mid': { id: 'Contested', role: 'mid', games: 60, wins: 33 },
+  };
+  const flat = computeTiers(contested, { minGames: 30, matches: 1000, bans: {} });
+  assert.strictEqual(
+    flat.detail.find((d) => d.id === 'Niche').composite,
+    flat.detail.find((d) => d.id === 'Contested').composite,
+    'identical records with no bans score identically',
+  );
+  const withBans = computeTiers(contested, {
+    minGames: 30, matches: 1000, bans: { Contested: 400 },
+  });
+  const ranked = withBans.detail.map((d) => d.id);
+  assert.strictEqual(ranked[0], 'Contested', 'a heavily banned champion outranks its twin');
+  assert.strictEqual(
+    withBans.detail.find((d) => d.id === 'Contested').banRate, 0.4,
+    'ban rate is bans per match',
+  );
+
+  // Rank band parsing.
+  assert.deepStrictEqual(parseRankTiers(''), [], 'empty means high elo');
+  assert.deepStrictEqual(parseRankTiers('HIGH_ELO'), [], 'HIGH_ELO means the ladders');
+  assert.deepStrictEqual(parseRankTiers('gold, platinum'), ['GOLD', 'PLATINUM'], 'list is normalised');
+  assert.throws(() => parseRankTiers('WOOD'), /unknown rank tier/);
+
   // A tiny role stays mid-table rather than handing out a free S+.
   const thin = computeTiers({
     'Solo|jungle': { id: 'Solo', role: 'jungle', games: 100, wins: 70 },
@@ -426,4 +577,4 @@ if (process.argv.includes('--self-test')) {
   });
 }
 
-module.exports = { collectMatch, computeTiers, validateFeed };
+module.exports = { collectMatch, computeTiers, validateFeed, parseRankTiers };
