@@ -266,36 +266,49 @@ async function main() {
   }
   shuffle(puuids);
 
-  // Collect match ids until the budget is met. 10 per player spreads the
-  // sample across many players rather than deeply into a few.
-  const matchIds = new Set();
+  // Interleave collecting ids and fetching matches so the budget counts
+  // matches we could actually use. Straight after a patch lands, half of even
+  // the most recent ranked games are still on the old one — counting ids
+  // instead would quietly halve the sample exactly when the meta is moving
+  // fastest and the data matters most.
+  const stats = {};
+  const seen = new Set();
+  const patchPrefix = patch.split('.').slice(0, 2).join('.');
+  let matches = 0;
+  let skippedPatch = 0;
+
   for (const puuid of puuids) {
-    if (matchIds.size >= matchBudget) break;
+    if (matches >= matchBudget) break;
     const ids = await riot.get(
       regionHost,
       `/lol/match/v5/matches/by-puuid/${puuid}/ids?queue=${RANKED_SOLO}&type=ranked&count=10`,
     );
-    for (const id of ids ?? []) matchIds.add(id);
-  }
-  console.log(`collected ${matchIds.size} match ids from ${riot.requests} requests`);
-
-  const stats = {};
-  let matches = 0;
-  let skippedPatch = 0;
-  const patchPrefix = patch.split('.').slice(0, 2).join('.');
-  for (const id of matchIds) {
-    const match = await riot.get(regionHost, `/lol/match/v5/matches/${id}`);
-    if (!match) continue;
-    // Keep the sample inside the current patch; older games describe a
-    // balance state that no longer exists.
-    if (!String(match.info?.gameVersion ?? '').startsWith(patchPrefix)) {
-      skippedPatch += 1;
-      continue;
+    for (const id of ids ?? []) {
+      if (matches >= matchBudget) break;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const match = await riot.get(regionHost, `/lol/match/v5/matches/${id}`);
+      if (!match) continue;
+      // Older games describe a balance state that no longer exists.
+      if (!String(match.info?.gameVersion ?? '').startsWith(patchPrefix)) {
+        skippedPatch += 1;
+        continue;
+      }
+      if (collectMatch(match, championById, stats) > 0) {
+        matches += 1;
+        if (matches % 100 === 0) {
+          console.log(`  ${matches}/${matchBudget} matches, ${riot.requests} requests`);
+        }
+      }
     }
-    if (collectMatch(match, championById, stats) > 0) matches += 1;
-    if (matches % 100 === 0 && matches > 0) console.log(`  ${matches} matches aggregated`);
   }
-  console.log(`aggregated ${matches} matches (${skippedPatch} skipped as off-patch)`);
+  console.log(
+    `aggregated ${matches} matches on patch ${patchPrefix} `
+    + `(${skippedPatch} skipped as off-patch, ${riot.requests} requests)`,
+  );
+  if (matches < matchBudget) {
+    console.warn(`  ran out of players before the budget — sampled ${matches}`);
+  }
 
   const { tiers, detail } = computeTiers(stats, { minGames });
   const feed = {
@@ -306,6 +319,13 @@ async function main() {
     sampleGames: matches,
     tiers,
   };
+
+  // Report before validating: when a run is rejected, the counts are what
+  // tell you whether the sample was too thin or the tiering went wrong.
+  const counts = {};
+  for (const t of Object.values(tiers)) counts[t] = (counts[t] ?? 0) + 1;
+  console.log(`computed ${Object.keys(tiers).length} champions`, counts);
+
   validateFeed(feed);
 
   fs.writeFileSync(out, `${JSON.stringify(feed, null, 2)}\n`);
@@ -313,9 +333,7 @@ async function main() {
   detail.sort((a, b) => b.shrunk - a.shrunk);
   fs.writeFileSync('tiers-detail.json', `${JSON.stringify({ patch, detail }, null, 2)}\n`);
 
-  const counts = {};
-  for (const t of Object.values(tiers)) counts[t] = (counts[t] ?? 0) + 1;
-  console.log(`wrote ${out}: ${Object.keys(tiers).length} champions`, counts);
+  console.log(`wrote ${out} and tiers-detail.json`);
 }
 
 function shuffle(a) {
