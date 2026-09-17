@@ -1,0 +1,55 @@
+name: Update tiers
+
+on:
+  schedule:
+    # Mondays 06:17 UTC. Off the hour on purpose — scheduled jobs pile up on
+    # the hour and GitHub drops the overflow.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-tiers
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # Sampling is paced for Riot's strictest rate limit, so a full run is
+    # closer to 40 minutes than 4.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Checks the tiering maths before spending an hour of API calls on it.
+      - name: Self-test
+        run: node update-tiers.cjs --self-test
+
+      - name: Compute tiers
+        env:
+          RIOT_API_KEY: ${{ secrets.RIOT_API_KEY }}
+          PLATFORM: euw1
+          MATCH_BUDGET: '1500'
+          MIN_GAMES: '30'
+        run: node update-tiers.cjs
+
+      # The script validates before writing, so anything here is publishable.
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- tiers.json; then
+            echo "Tiers unchanged — nothing to publish."
+            exit 0
+          fi
+          patch=$(node -e "console.log(require('./tiers.json').patch)")
+          games=$(node -e "console.log(require('./tiers.json').sampleGames)")
+          git config user.name "draft-king-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tiers.json tiers-detail.json
+          git commit -m "Tiers for patch ${patch} (${games} games)"
+          git push
