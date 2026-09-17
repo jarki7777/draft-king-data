@@ -76,12 +76,15 @@ Environment:
 | `MATCH_BUDGET` | `1500` | Usable matches to aggregate |
 | `MIN_GAMES` | `30` | Games in its main role before a champion is tiered |
 | `MATCH_WINDOW_DAYS` | `7` | Only sample games this recent |
-| `REQUEST_INTERVAL_MS` | `1250` | Dev-key safe; a Personal key can run ~150 |
-| `MAX_REQUESTS` | `12000` | Hard ceiling, so a thin sample can't run forever |
+| `REQUEST_INTERVAL_MS` | `1250` | Riot allows 100 requests per 2 minutes on development and Personal keys alike |
+| `TIME_BUDGET_MIN` | `75` | Stop sampling and publish what validates, rather than being killed mid-run |
 | `OUT` | `tiers.json` | Output path |
 
-At `REQUEST_INTERVAL_MS=150` a full run takes roughly 5–10 minutes. On a
-development key it is closer to 40, and dev keys expire every 24 hours.
+A full run takes roughly 35 minutes. The pace is set by Riot's rate limit,
+which is the same for development and Personal keys (100 requests per 2
+minutes) — a Personal key buys persistence, not speed. Only Production keys
+raise the limit. Development keys expire every 24 hours, so the scheduled job
+needs a Personal one.
 
 ## What this does not cover
 

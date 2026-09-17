@@ -43,9 +43,11 @@ jobs:
           # A week of games, matching the schedule. Longer wastes requests on
           # the previous patch; gameVersion discards those anyway.
           MATCH_WINDOW_DAYS: '7'
-          # Paced for a Personal key. A development key needs 1250 here.
-          REQUEST_INTERVAL_MS: '150'
-          MAX_REQUESTS: '12000'
+          # Riot allows 100 requests per 2 minutes on development AND
+          # Personal keys — 1.2s apart. Only Production keys go faster.
+          REQUEST_INTERVAL_MS: '1250'
+          # Publish a smaller validated sample rather than being killed mid-run.
+          TIME_BUDGET_MIN: '75'
         run: node update-tiers.cjs
 
       # The script validates before writing, so anything here is publishable.

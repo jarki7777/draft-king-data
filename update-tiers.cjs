@@ -351,12 +351,15 @@ async function main() {
   // window is mostly current-patch games; gameVersion still has the last word.
   const windowDays = Number(process.env.MATCH_WINDOW_DAYS || 7);
   const windowStart = Math.floor((Date.now() - windowDays * 86_400_000) / 1000);
-  // A hard ceiling so a bad ratio of usable games can't run until the job is
-  // killed, which would publish nothing at all.
-  const maxRequests = Number(process.env.MAX_REQUESTS || 12_000);
+  // Stop sampling at a wall-clock deadline rather than a request count: the
+  // pace is fixed by the rate limit, so minutes are what actually run out.
+  // Without this a thin sample runs until the job is killed and nothing is
+  // published at all — a smaller sample that validates is worth far more.
+  const timeBudgetMin = Number(process.env.TIME_BUDGET_MIN || 75);
+  const deadline = Date.now() + timeBudgetMin * 60_000;
   console.log(
     `sampling ${band} on ${platform}, budget ${matchBudget} matches, `
-    + `${windowDays}d window, ${maxRequests} request ceiling`,
+    + `${windowDays}d window, ${timeBudgetMin}min deadline`,
   );
 
   const platformHost = `${platform}.api.riotgames.com`;
@@ -396,7 +399,7 @@ async function main() {
 
   for (const puuid of puuids) {
     if (matches >= matchBudget) break;
-    if (riot.requests >= maxRequests) break;
+    if (Date.now() >= deadline) break;
     // Ask only for games inside the window. Without this the job spends most
     // of its requests fetching matches it then throws away for being on the
     // previous patch — 9 in 10 of them in a mid-ladder sample.
@@ -406,7 +409,7 @@ async function main() {
       + `?queue=${RANKED_SOLO}&type=ranked&count=20&startTime=${windowStart}`,
     );
     for (const id of ids ?? []) {
-      if (matches >= matchBudget || riot.requests >= maxRequests) break;
+      if (matches >= matchBudget || Date.now() >= deadline) break;
       if (seen.has(id)) continue;
       seen.add(id);
       const match = await riot.get(regionHost, `/lol/match/v5/matches/${id}`);
@@ -428,8 +431,8 @@ async function main() {
     `aggregated ${matches} matches on patch ${patchPrefix} `
     + `(${skippedPatch} skipped as off-patch, ${riot.requests} requests)`,
   );
-  if (riot.requests >= maxRequests) {
-    console.warn(`  hit the ${maxRequests} request ceiling — publishing what validated`);
+  if (Date.now() >= deadline) {
+    console.warn(`  hit the ${timeBudgetMin}min deadline — publishing what validated`);
   } else if (matches < matchBudget) {
     console.warn(`  ran out of players before the budget — sampled ${matches}`);
   }
